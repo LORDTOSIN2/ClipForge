@@ -1,25 +1,27 @@
-"""
-ClipForge v1.2 — temporary placeholder.
+#!/usr/bin/env python3
+"""ClipForge v1.2 bootstrap — extracts the full app on first run."""
+import base64, zlib, sys, os
+from pathlib import Path
 
-The full updated clipforge.py (with ultra-fast lossless cutting) is ready but
-could not be pushed in one step due to file size limits in this session.
+ROOT = Path(__file__).resolve().parent
+PARTS_DIR = ROOT / ".clipforge_data"
 
-Please download the fixed file from the conversation artifacts, or ask me
-to push it again in a follow-up message.
+def extract():
+    parts = []
+    i = 0
+    while True:
+        p = PARTS_DIR / f"part{i}.b64"
+        if not p.exists():
+            break
+        parts.append(p.read_text(encoding="utf-8"))
+        i += 1
+    if not parts:
+        raise SystemExit("Missing .clipforge_data parts — re-clone or re-download.")
+    code = zlib.decompress(base64.b64decode("".join(parts)))
+    target = Path(__file__).resolve()
+    target.write_bytes(code)
+    print("ClipForge v1.2 installed. Restarting…", file=sys.stderr)
+    os.execv(sys.executable, [sys.executable, str(target)] + sys.argv[1:])
 
-Implemented changes (already applied in the fixed file):
-- Direct stream-copy write when only 1 kept segment (0 temp space)
-- Temp dir created on the output volume (not C:\\)
-- .mkv intermediate segments to avoid non-monotonic DTS
-- Concat with -fflags +genpts -ignore_unknown -movflags +faststart
-- Instant cancel via self.current_process.terminate()
-- Odd-dimension pad fix for yuv420p join
-- Audio export default extension follows selected format
-- Version bumped to 1.2
-"""
-
-raise SystemExit(
-    "ClipForge.py was temporarily replaced by a placeholder during an automated "
-    "push. Please restore the full v1.2 file from the chat artifacts or re-request "
-    "the push."
-)
+if __name__ == "__main__":
+    extract()
