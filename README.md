@@ -1,4 +1,4 @@
-# ClipForge 1.3
+# ClipForge 1.4
 
 A lightweight CustomTkinter desktop frontend for FFmpeg focused on **fast, low-waste** video editing.
 
@@ -58,6 +58,19 @@ python clipforge.py
 - FFmpeg runs at **below-normal CPU priority** (Windows) so the system stays responsive.
 - Instant cancel. Output folder auto-suggested from input filename.
 
+### 3GPP Converter *(new in v1.4)*
+- Convert **images and videos** into files classic feature phones can play.
+- Videos are rendered to **3GPP-max `.3gp`**: MPEG-4 Part 2 video + mono AAC audio.
+- **Queue multiple files at once** — `Add Files` or `Add Folder` (recursive scan), with per-file status and a progress bar.
+- Video settings — maximum width (`176`–`640` px), video bitrate (`64k`–`200k`), audio bitrate (`16k`–`64k`), audio sample rate (`8000`–`44100` Hz).
+- Images are re-encoded to **baseline JPEG** with an adjustable quality slider and their own maximum edge.
+- **No upscaling** — the width cap only shrinks; a small source keeps its own size.
+- Optional **90° rotation** for portrait clips, and optional overwrite (off = numbered duplicates instead).
+- Sources with **no audio track** are exported without a silent track.
+- Files with no video stream or unsupported types are skipped and reported, not silently dropped.
+- Partial `.3gp` files are deleted if a render fails or is cancelled.
+- Runs at **below-normal CPU priority** (Windows) and supports instant cancel.
+
 ### General
 - `ffprobe` media information.
 - Progress bar and live FFmpeg log.
@@ -76,6 +89,15 @@ Stream-copy cutting is intentionally fast, but compressed video usually starts f
 Use **Frame-Accurate / Re-encode** when the exact frame matters.
 
 Fast joining also expects compatible streams. When inputs differ significantly, use **Re-encode / Normalize**.
+
+## What's new in 1.4
+
+- New **3GPP Converter** tab: batch-convert images and videos to 3GPP-max `.3gp` plus baseline JPEG.
+- 3GPP-max render profile (MPEG-4 Part 2 + mono AAC), width cap that never upscales, optional portrait rotation.
+- Multi-file queue with per-file status, folder scanning, overall progress bar, and clear-completed.
+- Optional overwrite-off mode writes numbered duplicates and never touches existing output.
+- Cancelled or failed video renders clean up their partial `.3gp` output.
+- `Open Folder` now reveals directory targets directly (used by the multi-file 3GPP output).
 
 ## What's new in 1.2
 

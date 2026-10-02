@@ -25,7 +25,7 @@ from PIL import Image
 # ============================================================
 
 APP_NAME = "ClipForge"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
 
 # Windows: hide console window & run FFmpeg at below-normal CPU priority
 if sys.platform == "win32":
@@ -51,6 +51,23 @@ WARNING = "#f59e0b"
 DANGER = "#ef4444"
 
 TIME_RE = re.compile(r"([+-]?\d+(?:\.\d+)?)")
+
+# --- 3GPP converter presets --------------------------------------------------
+# 3GPP-max (.3gp) targets very old 3G handsets, so the defaults stay small:
+# 320 px cap, MPEG-4 Part 2 video, 8 kHz mono AAC audio.
+THREEGPP_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff", ".gif"}
+THREEGPP_VIDEO_EXTS = {
+    ".mp4", ".mov", ".avi", ".mkv", ".flv", ".webm", ".wmv",
+    ".m4v", ".mpg", ".mpeg", ".3gp", ".ts", ".mts", ".m2ts",
+}
+THREEGPP_SIZE_PRESETS = ["176", "240", "320", "352", "480", "640"]
+THREEGPP_VIDEO_BITRATES = ["64k", "80k", "100k", "128k", "160k", "200k"]
+THREEGPP_AUDIO_BITRATES = ["16k", "24k", "32k", "48k", "64k"]
+THREEGPP_SAMPLE_RATES = ["8000", "11025", "16000", "22050", "44100"]
+DEFAULT_3GPP_MAX_SIZE = "320"
+DEFAULT_3GPP_VIDEO_BITRATE = "100k"
+DEFAULT_3GPP_AUDIO_BITRATE = "24k"
+DEFAULT_3GPP_SAMPLE_RATE = "8000"
 
 
 def format_seconds(value: float) -> str:
@@ -106,6 +123,61 @@ def safe_float(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+def format_bytes(size) -> str:
+    """Human-readable file size for queue rows and log lines."""
+    value = max(0.0, safe_float(size))
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f} B" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def format_3gpp_options(max_size, video_bitrate, audio_bitrate, audio_rate) -> str:
+    """One-line summary of the active 3GPP render settings."""
+    return (
+        f"{max_size}px  •  video {video_bitrate}  •  "
+        f"audio {audio_bitrate} AAC (mono {audio_rate} Hz)"
+    )
+
+
+def build_3gpp_video_command(
+    source,
+    output,
+    max_size=320,
+    video_bitrate="100k",
+    audio_bitrate="24k",
+    audio_rate="8000",
+    rotate_portrait=False,
+    is_portrait=False,
+    has_audio=True,
+):
+    """FFmpeg argv for a 3GPP-max (.3gp) render.
+
+    MPEG-4 Part 2 video plus mono AAC audio keeps the result playable on classic
+    3G handsets. The scale filter caps the width instead of forcing it, so a
+    small source is never upscaled, and the even-width rounding keeps the
+    yuv420p pixel format valid for the MPEG-4 encoder.
+    """
+    filters = []
+    if is_portrait and rotate_portrait:
+        filters.append("transpose=1")  # 90° clockwise
+    filters.append(f"scale='trunc(min(iw,{int(max_size)})/2)*2':-2")
+
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin", "-y",
+        "-i", source,
+        "-vf", ",".join(filters),
+        "-c:v", "mpeg4",
+        "-b:v", video_bitrate,
+    ]
+    if has_audio:
+        cmd += ["-c:a", "aac", "-b:a", audio_bitrate, "-ar", str(audio_rate), "-ac", "1"]
+    else:
+        cmd += ["-an"]
+    cmd += ["-f", "3gp", "-progress", "pipe:2", "-nostats", output]
+    return cmd
 
 
 class FFmpegError(RuntimeError):
@@ -668,6 +740,7 @@ class ClipForge(ctk.CTk):
             ("join", "⇄  Join Videos"),
             ("audio", "♫  Extract Audio"),
             ("frames", "🎞  Extract Frames"),
+            ("3gpp", "📱  3GPP Converter"),
         ], start=3):
             btn = ctk.CTkButton(
                 self.sidebar, text=label, height=42, anchor="w", corner_radius=9,
@@ -709,6 +782,7 @@ class ClipForge(ctk.CTk):
         self._build_join_tab()
         self._build_audio_tab()
         self._build_frames_tab()
+        self._build_3gpp_tab()
         self._show_tab("cut")
 
         # Bottom task bar shared by tools
@@ -988,13 +1062,14 @@ class ClipForge(ctk.CTk):
         self._update_audio_format("MP3")
 
     def _show_tab(self, name):
-        for frame in (self.cut_tab, self.join_tab, self.audio_tab, self.frames_tab):
+        for frame in (self.cut_tab, self.join_tab, self.audio_tab, self.frames_tab, self.three_gpp_tab):
             frame.grid_remove()
         tab = {
             "cut": self.cut_tab,
             "join": self.join_tab,
             "audio": self.audio_tab,
             "frames": self.frames_tab,
+            "3gpp": self.three_gpp_tab,
         }[name]
         tab.grid(row=0, column=0, sticky="nsew")
         for key, btn in self.nav_buttons.items():
@@ -1008,6 +1083,7 @@ class ClipForge(ctk.CTk):
             "join": ("Join Videos", "Stitch multiple clips together without touching the pixels when possible."),
             "audio": ("Extract Audio", "Save the first audio stream as MP3, M4A, or WAV."),
             "frames": ("Extract Frames", "Dump individual frames from any video as JPEG or PNG images."),
+            "3gpp": ("3GPP Converter", "Convert images and videos into small 3GPP-max .3gp files for classic phones."),
         }
         self.page_title.configure(text=titles[name][0])
         self.page_desc.configure(text=titles[name][1])
@@ -1572,6 +1648,604 @@ class ClipForge(ctk.CTk):
             self._set_current_process(None)
             self.ui_queue.put(("busy", False))
 
+    # ----------------------- 3GPP TAB -------------------------
+
+    def _three_gpp_default_output(self):
+        return str(Path.home() / "Videos" / "ClipForge_3GPP")
+
+    def _build_3gpp_tab(self):
+        self.three_gpp_tab = ctk.CTkScrollableFrame(
+            self.content, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT,
+            scrollbar_fg_color="transparent",
+        )
+        self.three_gpp_tab.grid(row=0, column=0, sticky="nsew")
+        self.three_gpp_tab.grid_columnconfigure(0, weight=1)
+
+        self.three_gpp_files = []          # ordered queue of absolute paths
+        self.three_gpp_rows = {}           # path -> {"row", "num", "status"}
+        self.three_gpp_last_output_dir = ""
+
+        # ── Source Queue Card ──────────────────────────────────────────────
+        queue_card = ctk.CTkFrame(self.three_gpp_tab, fg_color=PANEL, corner_radius=14)
+        queue_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        queue_card.grid_columnconfigure(0, weight=1)
+
+        head = ctk.CTkFrame(queue_card, fg_color="transparent")
+        head.grid(row=0, column=0, padx=16, pady=(13, 7), sticky="ew")
+        head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(head, text="SOURCE QUEUE", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+        ctk.CTkButton(head, text="＋ Add Files", width=102, height=32,
+                      command=self._browse_3gpp_files).grid(row=0, column=1, padx=(0, 6))
+        ctk.CTkButton(head, text="📁 Add Folder", width=112, height=32,
+                      command=self._browse_3gpp_folder).grid(row=0, column=2, padx=(0, 6))
+        ctk.CTkButton(head, text="Clear", width=72, height=32,
+                      fg_color="#263247", hover_color="#35435a",
+                      command=self.clear_3gpp_files).grid(row=0, column=3)
+
+        ctk.CTkLabel(queue_card,
+                     text="Images become baseline JPEGs · videos become 3GPP-max .3gp clips.",
+                     text_color=MUTED).grid(row=1, column=0, padx=16, pady=(0, 6), sticky="w")
+
+        self.three_gpp_scroll = ctk.CTkScrollableFrame(
+            queue_card, fg_color="#0d1424", corner_radius=10, height=232,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT,
+        )
+        self.three_gpp_scroll.grid(row=2, column=0, padx=12, pady=2, sticky="ew")
+        self.three_gpp_scroll.grid_columnconfigure(0, weight=1)
+        self.three_gpp_rows_frame = ctk.CTkFrame(self.three_gpp_scroll, fg_color="transparent")
+        self.three_gpp_rows_frame.grid(row=0, column=0, sticky="ew")
+        self.three_gpp_rows_frame.grid_columnconfigure(0, weight=1)
+        self.three_gpp_empty = ctk.CTkLabel(
+            self.three_gpp_rows_frame,
+            text="No files queued yet — add images or videos to convert.",
+            text_color="#64748b",
+        )
+        self.three_gpp_empty.grid(row=0, column=0, pady=55)
+
+        # ── Settings Card (left column: video, right column: image) ────────
+        settings_card = ctk.CTkFrame(self.three_gpp_tab, fg_color=PANEL, corner_radius=14)
+        settings_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        settings_card.grid_columnconfigure(0, weight=1, uniform="3gpp")
+        settings_card.grid_columnconfigure(1, weight=1, uniform="3gpp")
+
+        video_col = ctk.CTkFrame(settings_card, fg_color="transparent")
+        video_col.grid(row=0, column=0, padx=(16, 8), pady=14, sticky="new")
+        video_col.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(video_col, text="VIDEO SETTINGS", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(video_col, text="Maximum width", text_color=MUTED).grid(
+            row=1, column=0, pady=(10, 2), sticky="w")
+        self.three_gpp_size = tk.StringVar(value=DEFAULT_3GPP_MAX_SIZE)
+        ctk.CTkOptionMenu(video_col, variable=self.three_gpp_size,
+                          values=THREEGPP_SIZE_PRESETS, width=230,
+                          command=lambda _v: self._update_3gpp_summary()).grid(row=2, column=0, sticky="w")
+
+        ctk.CTkLabel(video_col, text="Video bitrate", text_color=MUTED).grid(
+            row=3, column=0, pady=(10, 2), sticky="w")
+        self.three_gpp_video_bitrate = tk.StringVar(value=DEFAULT_3GPP_VIDEO_BITRATE)
+        ctk.CTkOptionMenu(video_col, variable=self.three_gpp_video_bitrate,
+                          values=THREEGPP_VIDEO_BITRATES, width=230,
+                          command=lambda _v: self._update_3gpp_summary()).grid(row=4, column=0, sticky="w")
+
+        ctk.CTkLabel(video_col, text="Audio bitrate", text_color=MUTED).grid(
+            row=5, column=0, pady=(10, 2), sticky="w")
+        self.three_gpp_audio_bitrate = tk.StringVar(value=DEFAULT_3GPP_AUDIO_BITRATE)
+        ctk.CTkOptionMenu(video_col, variable=self.three_gpp_audio_bitrate,
+                          values=THREEGPP_AUDIO_BITRATES, width=230,
+                          command=lambda _v: self._update_3gpp_summary()).grid(row=6, column=0, sticky="w")
+
+        ctk.CTkLabel(video_col, text="Audio sample rate", text_color=MUTED).grid(
+            row=7, column=0, pady=(10, 2), sticky="w")
+        self.three_gpp_audio_rate = tk.StringVar(value=DEFAULT_3GPP_SAMPLE_RATE)
+        ctk.CTkOptionMenu(video_col, variable=self.three_gpp_audio_rate,
+                          values=THREEGPP_SAMPLE_RATES, width=230,
+                          command=lambda _v: self._update_3gpp_summary()).grid(row=8, column=0, sticky="w")
+
+        self.three_gpp_rotate = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(video_col, text="Rotate portrait video 90°",
+                        variable=self.three_gpp_rotate).grid(row=9, column=0, pady=(12, 0), sticky="w")
+        ctk.CTkLabel(video_col, text="Audio is always mixed down to mono AAC.",
+                     text_color="#64748b", font=ctk.CTkFont(size=11)).grid(
+            row=10, column=0, pady=(8, 0), sticky="w")
+
+        image_col = ctk.CTkFrame(settings_card, fg_color="transparent")
+        image_col.grid(row=0, column=1, padx=(8, 16), pady=14, sticky="new")
+        image_col.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(image_col, text="IMAGE SETTINGS", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(row=0, column=0, sticky="w")
+
+        ctk.CTkLabel(image_col, text="Maximum edge", text_color=MUTED).grid(
+            row=1, column=0, pady=(10, 2), sticky="w")
+        self.three_gpp_img_size = tk.StringVar(value=DEFAULT_3GPP_MAX_SIZE)
+        ctk.CTkOptionMenu(image_col, variable=self.three_gpp_img_size,
+                          values=THREEGPP_SIZE_PRESETS, width=230).grid(row=2, column=0, sticky="w")
+
+        ctk.CTkLabel(image_col, text="JPEG quality", text_color=MUTED).grid(
+            row=3, column=0, pady=(10, 2), sticky="w")
+        quality_row = ctk.CTkFrame(image_col, fg_color="transparent")
+        quality_row.grid(row=4, column=0, sticky="w")
+        self.three_gpp_img_quality = tk.IntVar(value=90)
+        self.three_gpp_quality_slider = ctk.CTkSlider(
+            quality_row, from_=50, to=100, number_of_steps=50,
+            variable=self.three_gpp_img_quality, width=160,
+            command=lambda _v: self._three_gpp_quality_changed(),
+        )
+        self.three_gpp_quality_slider.pack(side="left")
+        self.three_gpp_quality_label = ctk.CTkLabel(
+            quality_row, text="90", width=30, text_color=TEXT)
+        self.three_gpp_quality_label.pack(side="left", padx=(8, 0))
+
+        self.three_gpp_overwrite = tk.BooleanVar(value=True)
+        ctk.CTkCheckBox(image_col, text="Overwrite existing output files",
+                        variable=self.three_gpp_overwrite).grid(row=5, column=0, pady=(12, 0), sticky="w")
+        ctk.CTkLabel(image_col, text="Images are re-encoded to baseline-friendly JPEG.",
+                     text_color="#64748b", font=ctk.CTkFont(size=11)).grid(
+            row=6, column=0, pady=(8, 0), sticky="w")
+
+        # ── Output Card ────────────────────────────────────────────────────
+        out_card = ctk.CTkFrame(self.three_gpp_tab, fg_color=PANEL, corner_radius=14)
+        out_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        out_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(out_card, text="OUTPUT FOLDER", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 4), sticky="w")
+        out_line = ctk.CTkFrame(out_card, fg_color="transparent")
+        out_line.grid(row=1, column=0, padx=16, pady=(0, 15), sticky="ew")
+        out_line.grid_columnconfigure(0, weight=1)
+        self.three_gpp_output_entry = ctk.CTkEntry(out_line, height=36,
+                                                   placeholder_text="Output folder…")
+        self.three_gpp_output_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(out_line, text="Browse", width=90, height=36,
+                      command=self._choose_3gpp_output).grid(row=0, column=1, padx=(8, 0))
+        ctk.CTkButton(out_line, text="Open", width=72, height=36,
+                      fg_color="#263247", hover_color="#35435a",
+                      command=self._open_3gpp_output_folder).grid(row=0, column=2, padx=(8, 0))
+
+        # ── Summary & Actions ──────────────────────────────────────────────
+        exec_card = ctk.CTkFrame(self.three_gpp_tab, fg_color=PANEL, corner_radius=14)
+        exec_card.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        exec_card.grid_columnconfigure(0, weight=1)
+
+        self.three_gpp_summary_label = ctk.CTkLabel(
+            exec_card, text="Queue is empty.", text_color=MUTED, anchor="w")
+        self.three_gpp_summary_label.grid(row=0, column=0, padx=16, pady=(12, 0), sticky="ew")
+        self.three_gpp_queue_progress = ctk.CTkProgressBar(
+            exec_card, height=8, corner_radius=4, progress_color=ACCENT)
+        self.three_gpp_queue_progress.grid(row=1, column=0, padx=16, pady=(8, 0), sticky="ew")
+        self.three_gpp_queue_progress.set(0)
+
+        action_row = ctk.CTkFrame(exec_card, fg_color="transparent")
+        action_row.grid(row=2, column=0, padx=16, pady=(10, 14), sticky="ew")
+        ctk.CTkButton(
+            action_row, text="Clear Completed", width=140, height=36,
+            fg_color="#263247", hover_color="#35435a",
+            command=self._clear_3gpp_completed,
+        ).pack(side="left")
+        ctk.CTkButton(
+            action_row, text="⚡  Convert to 3GPP", width=190, height=40,
+            command=self.start_3gpp,
+        ).pack(side="right")
+
+        # ── Info tip ───────────────────────────────────────────────────────
+        tip = ctk.CTkFrame(self.three_gpp_tab, fg_color="#101a2c", corner_radius=12)
+        tip.grid(row=4, column=0, sticky="ew", pady=(0, 16))
+        ctk.CTkLabel(tip, text="Tip", text_color="#c7d2fe",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 2))
+        ctk.CTkLabel(
+            tip,
+            text=("3GPP-max keeps clips small enough for classic feature-phone memory cards: "
+                  "MPEG-4 Part 2 video, mono AAC audio, and a hard width cap so nothing is ever "
+                  "upscaled. Re-encoding is required here — a stream copy cannot change "
+                  "resolution or codec family, so this tab always renders. Videos with no audio "
+                  "track are exported without a silent track."),
+            text_color=MUTED, wraplength=840, justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+        self._update_3gpp_summary()
+
+    def _three_gpp_quality_changed(self):
+        self.three_gpp_quality_label.configure(text=str(self.three_gpp_img_quality.get()))
+
+    def _is_3gpp_media(self, path):
+        ext = Path(path).suffix.lower()
+        if ext in THREEGPP_IMAGE_EXTS:
+            return "image"
+        if ext in THREEGPP_VIDEO_EXTS:
+            return "video"
+        return None
+
+    def _browse_3gpp_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Select images or videos",
+            filetypes=[
+                ("Images and videos",
+                 "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff *.gif "
+                 "*.mp4 *.mov *.avi *.mkv *.flv *.webm *.wmv *.m4v *.mpg *.mpeg *.3gp *.ts"),
+                ("Images", "*.jpg *.jpeg *.png *.bmp *.webp *.tif *.tiff *.gif"),
+                ("Videos", "*.mp4 *.mov *.avi *.mkv *.flv *.webm *.wmv *.m4v *.mpg *.mpeg *.3gp *.ts"),
+                ("All files", "*.*"),
+            ],
+        )
+        if paths:
+            self._add_3gpp_files(paths)
+
+    def _browse_3gpp_folder(self):
+        folder = filedialog.askdirectory(title="Select a folder of media")
+        if not folder:
+            return
+        discovered = []
+        for root, _dirs, files in os.walk(folder):
+            for name in files:
+                path = os.path.join(root, name)
+                if self._is_3gpp_media(path):
+                    discovered.append(path)
+        if discovered:
+            self._add_3gpp_files(discovered)
+            self.log(f"3GPP: scanned folder and found {len(discovered)} convertible file(s).")
+        else:
+            messagebox.showinfo("Add Folder", "No supported images or videos found in that folder.")
+
+    def _add_3gpp_files(self, paths):
+        added = 0
+        skipped = 0
+        for raw in paths:
+            path = os.path.abspath(raw)
+            if not os.path.isfile(path):
+                continue
+            kind = self._is_3gpp_media(path)
+            if not kind:
+                skipped += 1
+                continue
+            if any(os.path.normcase(p) == os.path.normcase(path) for p in self.three_gpp_files):
+                continue
+
+            index = len(self.three_gpp_files) + 1
+            self.three_gpp_files.append(path)
+            try:
+                size = format_bytes(os.path.getsize(path))
+            except OSError:
+                size = "?"
+
+            row = ctk.CTkFrame(self.three_gpp_rows_frame, fg_color=PANEL_2, corner_radius=10)
+            row.grid(row=index, column=0, sticky="ew", pady=3, padx=2)
+            row.grid_columnconfigure(2, weight=1)
+            num = ctk.CTkLabel(row, text=f"{index:02d}", width=32, text_color=MUTED,
+                               font=ctk.CTkFont(size=11, weight="bold"))
+            num.grid(row=0, column=0, padx=(10, 4), pady=9)
+            ctk.CTkLabel(row, text="Image" if kind == "image" else "Video", width=58,
+                         text_color=SUCCESS if kind == "image" else ACCENT).grid(
+                row=0, column=1, padx=(0, 8), sticky="w")
+            ctk.CTkLabel(row, text=f"{Path(path).name}   ({size})", anchor="w").grid(
+                row=0, column=2, padx=4, sticky="ew")
+            status = ctk.CTkLabel(row, text="Queued", width=96, text_color=MUTED)
+            status.grid(row=0, column=3, padx=6, sticky="e")
+            ctk.CTkButton(row, text="×", width=32, height=30,
+                          fg_color="#222b3e", hover_color="#3b2532",
+                          text_color="#ffb4c1",
+                          command=lambda p=path: self._remove_3gpp_file(p)).grid(
+                row=0, column=4, padx=(2, 10), pady=8)
+            self.three_gpp_rows[path] = {"row": row, "num": num, "status": status}
+            added += 1
+
+        if added:
+            self.three_gpp_empty.grid_remove()
+        if self.three_gpp_files and not self.three_gpp_output_entry.get().strip():
+            self._set_entry(self.three_gpp_output_entry, self._three_gpp_default_output())
+        self._update_3gpp_summary()
+        if added:
+            self.log(f"3GPP: added {added} file(s) to the queue."
+                     + (f" Skipped {skipped} unsupported file(s)." if skipped else ""))
+        elif skipped:
+            messagebox.showinfo("Add Files", "Those files are not supported images or videos.")
+
+    def _remove_3gpp_file(self, path):
+        entry = self.three_gpp_rows.pop(path, None)
+        if entry is None:
+            return
+        entry["row"].destroy()
+        self.three_gpp_files = [p for p in self.three_gpp_files if p != path]
+        for index, other in enumerate(self.three_gpp_files, start=1):
+            self.three_gpp_rows[other]["num"].configure(text=f"{index:02d}")
+        if not self.three_gpp_files:
+            self.three_gpp_empty.grid()
+        self._update_3gpp_summary()
+
+    def clear_3gpp_files(self):
+        if self.busy:
+            return
+        for entry in self.three_gpp_rows.values():
+            entry["row"].destroy()
+        self.three_gpp_rows.clear()
+        self.three_gpp_files.clear()
+        self.three_gpp_empty.grid()
+        self.three_gpp_queue_progress.set(0)
+        self._update_3gpp_summary()
+        self.progress_label.configure(text="3GPP queue cleared.")
+
+    def _clear_3gpp_completed(self):
+        if self.busy:
+            return
+        finished = [path for path, entry in self.three_gpp_rows.items()
+                    if entry["status"].cget("text") in ("Done", "Failed", "Skipped", "Cancelled")]
+        if not finished:
+            self.progress_label.configure(text="No finished items to clear.")
+            return
+        for path in finished:
+            self._remove_3gpp_file(path)
+        self.progress_label.configure(text=f"Removed {len(finished)} finished item(s) from the queue.")
+
+    def _update_3gpp_summary(self):
+        counts = {"image": 0, "video": 0}
+        for path in self.three_gpp_files:
+            kind = self._is_3gpp_media(path)
+            if kind:
+                counts[kind] += 1
+        total = counts["image"] + counts["video"]
+        if not total:
+            self.three_gpp_summary_label.configure(text="Queue is empty.")
+            return
+        self.three_gpp_summary_label.configure(
+            text=(f"{total} file(s) queued — {counts['video']} video, {counts['image']} image  •  "
+                  + format_3gpp_options(
+                      self.three_gpp_size.get(), self.three_gpp_video_bitrate.get(),
+                      self.three_gpp_audio_bitrate.get(), self.three_gpp_audio_rate.get()))
+        )
+
+    def _set_3gpp_row_status(self, path, text, color):
+        entry = self.three_gpp_rows.get(path)
+        if entry is not None:
+            entry["status"].configure(text=text, text_color=color)
+
+    def _choose_3gpp_output(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self._set_entry(self.three_gpp_output_entry, folder)
+
+    def _open_3gpp_output_folder(self):
+        folder = self.three_gpp_last_output_dir or self.three_gpp_output_entry.get().strip()
+        if folder and os.path.isdir(folder):
+            self._open_directory(folder)
+        else:
+            messagebox.showwarning("Folder not found",
+                                   "The output folder does not exist yet.\nRun a conversion first.")
+
+    def start_3gpp(self):
+        if self.busy:
+            return
+        if not self._ensure_tools():
+            return
+        if not self.three_gpp_files:
+            messagebox.showerror("Convert to 3GPP", "Add at least one image or video first.")
+            return
+
+        try:
+            max_size = int(self.three_gpp_size.get())
+            img_size = int(self.three_gpp_img_size.get())
+            if max_size <= 0 or img_size <= 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Convert to 3GPP", "Maximum size values must be positive numbers.")
+            return
+
+        try:
+            audio_rate = int(self.three_gpp_audio_rate.get())
+        except ValueError:
+            messagebox.showerror("Convert to 3GPP", "Audio sample rate must be a number.")
+            return
+
+        out_folder = self.three_gpp_output_entry.get().strip()
+        if not out_folder:
+            messagebox.showerror("Convert to 3GPP", "Choose an output folder.")
+            return
+        try:
+            os.makedirs(out_folder, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Convert to 3GPP", f"Could not create that folder:\n{exc}")
+            return
+
+        # Rendering to 3GP always re-encodes, so the queue is written over in place by
+        # default. When overwriting is turned off, ask once here instead of once per file
+        # in the middle of a batch... and then never overwrite anything.
+        if self.three_gpp_overwrite.get():
+            existing = []
+            for path in self.three_gpp_files:
+                kind = self._is_3gpp_media(path)
+                if not kind:
+                    continue
+                ext = ".jpg" if kind == "image" else ".3gp"
+                target = os.path.join(out_folder, Path(path).stem + ext)
+                if os.path.exists(target):
+                    existing.append(target)
+            if existing and not messagebox.askyesno(
+                "Files already exist",
+                f"{len(existing)} output file(s) already exist in:\n\n{out_folder}\n\n"
+                "Overwrite them?",
+            ):
+                return
+
+        settings = {
+            "max_size": max_size,
+            "img_size": img_size,
+            "img_quality": self.three_gpp_img_quality.get(),
+            "video_bitrate": self.three_gpp_video_bitrate.get(),
+            "audio_bitrate": self.three_gpp_audio_bitrate.get(),
+            "audio_rate": audio_rate,
+            "rotate_portrait": self.three_gpp_rotate.get(),
+            "overwrite": self.three_gpp_overwrite.get(),
+        }
+
+        for path in self.three_gpp_files:
+            self._set_3gpp_row_status(path, "Queued", MUTED)
+        self.three_gpp_queue_progress.set(0)
+        self.cancel_event = threading.Event()
+        threading.Thread(
+            target=self._three_gpp_worker,
+            args=(list(self.three_gpp_files), out_folder, settings),
+            daemon=True,
+        ).start()
+
+    def _three_gpp_worker(self, files, out_folder, settings):
+        self.ui_queue.put(("busy", True))
+        self.ui_queue.put(("3gpp_folder", out_folder))
+        self.ui_queue.put(("progress", 0.0, "Preparing 3GPP conversion…"))
+        done = 0
+        failed = 0
+        skipped = 0
+        cancelled = False
+        total_files = max(len(files), 1)
+        self.three_gpp_last_output_dir = out_folder
+        try:
+            for index, path in enumerate(files):
+                if self.cancel_event.is_set():
+                    cancelled = True
+                    break
+
+                kind = self._is_3gpp_media(path)
+                name = Path(path).name
+                if not kind:
+                    skipped += 1
+                    self.ui_queue.put(("3gpp_status", path, "Skipped", WARNING))
+                    continue
+
+                self.ui_queue.put(("3gpp_status", path, "Working", ACCENT))
+                self.ui_queue.put(("3gpp_queue", index / total_files))
+
+                try:
+                    if kind == "image":
+                        self._three_gpp_convert_image(path, out_folder, settings)
+                    else:
+                        self._three_gpp_convert_video(path, out_folder, settings, index, total_files)
+                except FFmpegError as exc:
+                    if self.cancel_event.is_set():
+                        self.ui_queue.put(("3gpp_status", path, "Cancelled", WARNING))
+                        cancelled = True
+                        break
+                    failed += 1
+                    self.log(f"3GPP failed: {name} | {exc}")
+                    self.ui_queue.put(("3gpp_status", path, "Failed", DANGER))
+                except Exception as exc:
+                    failed += 1
+                    self.log(f"3GPP failed: {name} | {exc}")
+                    self.ui_queue.put(("3gpp_status", path, "Failed", DANGER))
+                else:
+                    done += 1
+                    self.ui_queue.put(("3gpp_status", path, "Done", SUCCESS))
+
+                self.ui_queue.put(("3gpp_queue", (index + 1) / total_files))
+
+            if cancelled:
+                self.ui_queue.put(("progress", 0.0, "Cancelled."))
+                self.log(f"3GPP conversion cancelled — {done} file(s) finished before stopping.")
+                return
+
+            self.log(f"3GPP conversion complete: {done} converted, {failed} failed, "
+                     f"{skipped} skipped → {out_folder}")
+            summary = f"Converted: {done}\nFailed: {failed}"
+            if skipped:
+                summary += f"\nSkipped: {skipped}"
+            summary += f"\n\nOutput folder:\n{out_folder}"
+            self.ui_queue.put(("finished", "3GPP conversion complete", summary))
+        except Exception as exc:
+            self.log(f"3GPP conversion error: {exc}")
+            self.ui_queue.put(("error", "3GPP conversion failed", str(exc)))
+        finally:
+            self._set_current_process(None)
+            self.ui_queue.put(("busy", False))
+
+    @staticmethod
+    def _unique_output_path(folder, stem, ext):
+        """First free name in `folder`, used when overwriting is disabled."""
+        candidate = os.path.join(folder, f"{stem}{ext}")
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(folder, f"{stem}_{counter}{ext}")
+            counter += 1
+        return candidate
+
+    def _three_gpp_convert_image(self, path, out_folder, settings):
+        if settings["overwrite"]:
+            output = os.path.join(out_folder, Path(path).stem + ".jpg")
+        else:
+            output = self._unique_output_path(out_folder, Path(path).stem, ".jpg")
+        image = Image.open(path).convert("RGB")
+        original = image.size
+        image.thumbnail((settings["img_size"], settings["img_size"]), Image.Resampling.LANCZOS)
+        image.save(output, format="JPEG", quality=settings["img_quality"],
+                   optimize=True, progressive=False)
+        self.log(f"3GPP image: {Path(path).name} → {Path(output).name} "
+                 f"({original[0]}x{original[1]} → {image.size[0]}x{image.size[1]})")
+        self.last_output = output
+
+    def _three_gpp_convert_video(self, path, out_folder, settings, index, total):
+        if settings["overwrite"]:
+            output = os.path.join(out_folder, Path(path).stem + ".3gp")
+        else:
+            output = self._unique_output_path(out_folder, Path(path).stem, ".3gp")
+
+        probe = MediaTools.probe(path)
+        duration = MediaTools.duration(path)
+        video = next((s for s in probe.get("streams", []) if s.get("codec_type") == "video"), None)
+        if not video:
+            raise FFmpegError("No video stream found in this file.")
+        has_audio = MediaTools.has_audio(probe)
+        width = safe_float(video.get("width"), 0)
+        height = safe_float(video.get("height"), 0)
+        is_portrait = height > width
+
+        cmd = build_3gpp_video_command(
+            path, output,
+            max_size=settings["max_size"],
+            video_bitrate=settings["video_bitrate"],
+            audio_bitrate=settings["audio_bitrate"],
+            audio_rate=settings["audio_rate"],
+            rotate_portrait=settings["rotate_portrait"],
+            is_portrait=is_portrait,
+            has_audio=has_audio,
+        )
+        self.log("3GPP command: " + " ".join(f'"{c}"' if " " in c else c for c in cmd))
+
+        base = index / total
+        span = 1.0 / total
+        if is_portrait and settings["rotate_portrait"]:
+            orientation = "portrait → rotated"
+        elif is_portrait:
+            orientation = "portrait"
+        else:
+            orientation = "landscape"
+
+        try:
+            MediaTools.run(
+                cmd,
+                log_callback=self.log,
+                progress_callback=lambda current: self.ui_queue.put((
+                    "progress",
+                    min(base + (current / max(duration, 1)) * span, 1.0),
+                    f"Encoding {Path(path).name} — "
+                    f"{min(100, current / max(duration, 1) * 100):.0f}%",
+                )),
+                cancel_event=self.cancel_event,
+                proc_callback=self._set_current_process,
+            )
+        except FFmpegError:
+            # Never leave a half-written .3gp behind for a failed or cancelled render.
+            if os.path.exists(output):
+                try:
+                    os.remove(output)
+                except OSError:
+                    pass
+            raise
+
+        size_txt = format_bytes(os.path.getsize(output)) if os.path.exists(output) else "?"
+        self.log(f"3GPP video: {Path(path).name} → {Path(output).name} "
+                 f"[{orientation}, audio: {'mono AAC' if has_audio else 'none'}, {size_txt}]")
+        self.last_output = output
+
+
     # ------------------------ Common helpers ------------------------
 
     def _check_ffmpeg(self):
@@ -1660,6 +2334,16 @@ class ClipForge(ctk.CTk):
                     self.progress.set(0)
                     self.progress_label.configure(text="Ready")
                     self._frames_update_estimate()
+                elif kind == "3gpp_status":
+                    path, text, color = event[1], event[2], event[3]
+                    self._set_3gpp_row_status(path, text, color)
+                elif kind == "3gpp_queue":
+                    self.three_gpp_queue_progress.set(event[1])
+                elif kind == "3gpp_folder":
+                    # A 3GPP run produces many files in one folder, so "Open Folder"
+                    # should reveal that folder rather than one arbitrary output file.
+                    self.three_gpp_last_output_dir = event[1]
+                    self.last_output = event[1]
                 elif kind == "frames_update":
                     pct, frame_count = event[1], event[2]
                     self.progress.set(pct)
@@ -1691,10 +2375,31 @@ class ClipForge(ctk.CTk):
     def open_last_output(self):
         """Open the folder containing the last output file, or the last loaded input."""
         target = self.last_output or self.input_path or ""
-        if target and os.path.exists(target):
+        if target and os.path.isdir(target):
+            self._open_directory(target)
+        elif target and os.path.exists(target):
             self._open_folder(target)
         else:
             self.progress_label.configure(text="No output file yet.")
+
+    def _open_directory(self, folder):
+        """Open a directory itself.
+
+        Unlike _open_folder(), which reveals the parent of a file, this opens the
+        given directory - needed when the last output was a folder of results.
+        """
+        try:
+            folder = str(Path(folder).resolve())
+            if not os.path.isdir(folder):
+                raise NotADirectoryError(folder)
+            if os.name == "nt":
+                os.startfile(folder)
+            elif shutil.which("xdg-open"):
+                subprocess.Popen(["xdg-open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif shutil.which("open"):
+                subprocess.Popen(["open", folder], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            self.log(f"Could not open folder: {exc}")
 
     def _open_folder(self, path):
         try:
