@@ -751,6 +751,7 @@ class ClipForge(ctk.CTk):
             scrollbar_button_hover_color=ACCENT,
             scrollbar_fg_color="transparent",
         )
+        self.cut_tab.grid(row=0, column=0, sticky="nsew")
         self.cut_tab.grid_columnconfigure(0, weight=1)
 
         input_card = ctk.CTkFrame(self.cut_tab, fg_color=PANEL, corner_radius=14)
@@ -874,6 +875,7 @@ class ClipForge(ctk.CTk):
             scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT,
             scrollbar_fg_color="transparent",
         )
+        self.join_tab.grid(row=0, column=0, sticky="nsew")
         self.join_tab.grid_columnconfigure(0, weight=1)
 
         card = ctk.CTkFrame(self.join_tab, fg_color=PANEL, corner_radius=14)
@@ -924,6 +926,7 @@ class ClipForge(ctk.CTk):
             scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT,
             scrollbar_fg_color="transparent",
         )
+        self.audio_tab.grid(row=0, column=0, sticky="nsew")
         self.audio_tab.grid_columnconfigure(0, weight=1)
 
         card = ctk.CTkFrame(self.audio_tab, fg_color=PANEL, corner_radius=14)
@@ -977,7 +980,7 @@ class ClipForge(ctk.CTk):
         for frame in (self.cut_tab, self.join_tab, self.audio_tab):
             frame.grid_remove()
         tab = {"cut": self.cut_tab, "join": self.join_tab, "audio": self.audio_tab}[name]
-        tab.grid()
+        tab.grid(row=0, column=0, sticky="nsew")
         for key, btn in self.nav_buttons.items():
             active = key == name
             btn.configure(
