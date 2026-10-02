@@ -18,3 +18,22 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# ClipForge temp / recovery data
+.clipforge_data/
+*.b64
+
+# Test / sample media (keep source clean)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.jpg
+*.jpeg
+*.png
+!docs/**
+
+# Local output / logs
+output/
+*.log
