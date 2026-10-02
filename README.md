@@ -1,4 +1,4 @@
-# ClipForge 1.2
+# ClipForge 1.3
 
 A lightweight CustomTkinter desktop frontend for FFmpeg focused on **fast, low-waste** video editing.
 
@@ -43,6 +43,20 @@ python clipforge.py
 - **M4A (AAC)** at 256 kbps.
 - **WAV** uncompressed PCM.
 - Default output extension follows the selected format.
+
+### Extract Frames *(new in v1.3)*
+- Four extraction modes:
+  - **Fixed FPS** — one frame every N frames-per-second (e.g. `1` = one per second, `12` = 12/s).
+  - **All Frames** — dumps every decoded frame (can produce thousands of files).
+  - **Keyframes (I-Frames) Only** — ultra-fast; no P/B decode, just seeks to keyframes.
+  - **Scene Cut Detection** — one representative frame per scene change, tunable threshold.
+- **Time range** — whole video or custom `From / To` timecode.
+- **Output format** — JPEG (with quality slider 2–31) or PNG (lossless).
+- **Post-processing** — optional grayscale conversion and width-based resize (height auto-scaled).
+- **Naming config** — custom filename prefix, start number, and zero-padding width.
+- **Live estimate** — shows approximate frame count before you start.
+- FFmpeg runs at **below-normal CPU priority** (Windows) so the system stays responsive.
+- Instant cancel. Output folder auto-suggested from input filename.
 
 ### General
 - `ffprobe` media information.

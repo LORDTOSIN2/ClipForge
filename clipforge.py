@@ -25,7 +25,16 @@ from PIL import Image
 # ============================================================
 
 APP_NAME = "ClipForge"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
+
+# Windows: hide console window & run FFmpeg at below-normal CPU priority
+if sys.platform == "win32":
+    _WIN_STARTUPINFO = subprocess.STARTUPINFO()
+    _WIN_STARTUPINFO.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    _WIN_CREATE_FLAGS = subprocess.CREATE_NO_WINDOW | 0x00004000  # BELOW_NORMAL_PRIORITY_CLASS
+else:
+    _WIN_STARTUPINFO = None
+    _WIN_CREATE_FLAGS = 0
 
 # Modern dark palette. CustomTkinter still handles widget states,
 # corner radius, scaling and system appearance for us.
@@ -658,6 +667,7 @@ class ClipForge(ctk.CTk):
             ("cut", "✂  Cut & Remove"),
             ("join", "⇄  Join Videos"),
             ("audio", "♫  Extract Audio"),
+            ("frames", "🎞  Extract Frames"),
         ], start=3):
             btn = ctk.CTkButton(
                 self.sidebar, text=label, height=42, anchor="w", corner_radius=9,
@@ -698,6 +708,7 @@ class ClipForge(ctk.CTk):
         self._build_cut_tab()
         self._build_join_tab()
         self._build_audio_tab()
+        self._build_frames_tab()
         self._show_tab("cut")
 
         # Bottom task bar shared by tools
@@ -977,9 +988,14 @@ class ClipForge(ctk.CTk):
         self._update_audio_format("MP3")
 
     def _show_tab(self, name):
-        for frame in (self.cut_tab, self.join_tab, self.audio_tab):
+        for frame in (self.cut_tab, self.join_tab, self.audio_tab, self.frames_tab):
             frame.grid_remove()
-        tab = {"cut": self.cut_tab, "join": self.join_tab, "audio": self.audio_tab}[name]
+        tab = {
+            "cut": self.cut_tab,
+            "join": self.join_tab,
+            "audio": self.audio_tab,
+            "frames": self.frames_tab,
+        }[name]
         tab.grid(row=0, column=0, sticky="nsew")
         for key, btn in self.nav_buttons.items():
             active = key == name
@@ -991,9 +1007,570 @@ class ClipForge(ctk.CTk):
             "cut": ("Cut & Remove", "Remove one or more sections using fast stream copying."),
             "join": ("Join Videos", "Stitch multiple clips together without touching the pixels when possible."),
             "audio": ("Extract Audio", "Save the first audio stream as MP3, M4A, or WAV."),
+            "frames": ("Extract Frames", "Dump individual frames from any video as JPEG or PNG images."),
         }
         self.page_title.configure(text=titles[name][0])
         self.page_desc.configure(text=titles[name][1])
+
+    # ----------------------- FRAMES TAB -------------------------
+
+    def _build_frames_tab(self):
+        self.frames_tab = ctk.CTkScrollableFrame(
+            self.content, fg_color="transparent", corner_radius=0,
+            scrollbar_button_color=BORDER, scrollbar_button_hover_color=ACCENT,
+            scrollbar_fg_color="transparent",
+        )
+        self.frames_tab.grid(row=0, column=0, sticky="nsew")
+        self.frames_tab.grid_columnconfigure(0, weight=1)
+
+        # Frame state
+        self.frames_input_path = ""
+        self.frames_input_duration = 0.0
+        self.frames_input_fps = 0.0
+
+        # ── Source Video Card ──────────────────────────────────────────────
+        src_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        src_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        src_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(src_card, text="SOURCE VIDEO", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 4), sticky="w")
+        src_line = ctk.CTkFrame(src_card, fg_color="transparent")
+        src_line.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="ew")
+        src_line.grid_columnconfigure(0, weight=1)
+        self.frames_input_entry = ctk.CTkEntry(src_line, placeholder_text="Select a video file…", height=38)
+        self.frames_input_entry.grid(row=0, column=0, sticky="ew")
+        self.frames_input_entry.bind("<Return>", lambda _e: self._load_frames_input())
+        ctk.CTkButton(src_line, text="Browse", width=105, height=38,
+                      command=self._browse_frames_input).grid(row=0, column=1, padx=(8, 0))
+        self.frames_info_label = ctk.CTkLabel(src_card, text="No video loaded",
+                                              text_color=MUTED, anchor="w")
+        self.frames_info_label.grid(row=2, column=0, padx=16, pady=(0, 13), sticky="ew")
+
+        # ── Extraction Mode Card ───────────────────────────────────────────
+        mode_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        mode_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        mode_card.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(mode_card, text="EXTRACTION MODE", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, columnspan=3, padx=16, pady=(14, 6), sticky="w")
+
+        self.frames_mode = tk.StringVar(value="fps")
+        modes = [
+            ("fps",       "Fixed FPS",               "Extract at a specific frames-per-second rate"),
+            ("all",       "All Frames",               "Extract every single frame (can be thousands)"),
+            ("keyframes", "Keyframes (I-Frames) Only", "Ultra-fast — only keyframes, no re-decode"),
+            ("scene",     "Scene Cut Detection",      "One frame per detected scene change"),
+        ]
+        for i, (val, label, hint) in enumerate(modes):
+            rb = ctk.CTkRadioButton(
+                mode_card, text=label, variable=self.frames_mode, value=val,
+                font=ctk.CTkFont(size=13),
+                command=self._frames_mode_changed,
+            )
+            rb.grid(row=i + 1, column=0, padx=16, pady=4, sticky="w")
+            ctk.CTkLabel(mode_card, text=hint, text_color=MUTED,
+                         font=ctk.CTkFont(size=11)).grid(
+                row=i + 1, column=1, padx=8, pady=4, sticky="w")
+
+        # FPS sub-input
+        fps_row = ctk.CTkFrame(mode_card, fg_color="transparent")
+        fps_row.grid(row=5, column=0, columnspan=2, padx=16, pady=(4, 2), sticky="w")
+        ctk.CTkLabel(fps_row, text="Rate:", text_color=MUTED).pack(side="left")
+        self.frames_fps_entry = ctk.CTkEntry(fps_row, width=72, height=30,
+                                              placeholder_text="12")
+        self.frames_fps_entry.pack(side="left", padx=(6, 4))
+        self.frames_fps_entry.insert(0, "12")
+        self.frames_fps_entry.bind("<KeyRelease>", lambda _e: self._frames_update_estimate())
+        ctk.CTkLabel(fps_row, text="frames / second", text_color=MUTED).pack(side="left")
+        self.frames_fps_row = fps_row
+
+        # Scene threshold sub-input
+        scene_row = ctk.CTkFrame(mode_card, fg_color="transparent")
+        scene_row.grid(row=6, column=0, columnspan=2, padx=16, pady=(2, 6), sticky="w")
+        ctk.CTkLabel(scene_row, text="Threshold (0.0–1.0):", text_color=MUTED).pack(side="left")
+        self.frames_scene_entry = ctk.CTkEntry(scene_row, width=68, height=30,
+                                                placeholder_text="0.3")
+        self.frames_scene_entry.pack(side="left", padx=(6, 4))
+        self.frames_scene_entry.insert(0, "0.3")
+        ctk.CTkLabel(scene_row, text="(lower = more cuts)", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(side="left")
+        self.frames_scene_row = scene_row
+        self._frames_mode_changed()
+
+        # ── Time Range Card ────────────────────────────────────────────────
+        range_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        range_card.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        range_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(range_card, text="TIME RANGE", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+
+        self.frames_range_mode = tk.StringVar(value="full")
+        ctk.CTkRadioButton(
+            range_card, text="Whole video", variable=self.frames_range_mode, value="full",
+            command=self._frames_update_estimate,
+        ).grid(row=1, column=0, padx=16, pady=3, sticky="w")
+        ctk.CTkRadioButton(
+            range_card, text="Custom range", variable=self.frames_range_mode, value="range",
+            command=self._frames_update_estimate,
+        ).grid(row=2, column=0, padx=16, pady=3, sticky="w")
+
+        range_inputs = ctk.CTkFrame(range_card, fg_color="transparent")
+        range_inputs.grid(row=3, column=0, padx=16, pady=(2, 12), sticky="w")
+        ctk.CTkLabel(range_inputs, text="From:", text_color=MUTED).pack(side="left")
+        self.frames_start_entry = ctk.CTkEntry(range_inputs, width=100, height=30,
+                                               placeholder_text="00:00")
+        self.frames_start_entry.pack(side="left", padx=(6, 4))
+        self.frames_start_entry.insert(0, "00:00")
+        ctk.CTkLabel(range_inputs, text="To:", text_color=MUTED).pack(side="left", padx=(10, 0))
+        self.frames_end_entry = ctk.CTkEntry(range_inputs, width=100, height=30,
+                                             placeholder_text="00:30")
+        self.frames_end_entry.pack(side="left", padx=(6, 0))
+        self.frames_end_entry.insert(0, "00:30")
+        for w in (self.frames_start_entry, self.frames_end_entry):
+            w.bind("<KeyRelease>", lambda _e: self._frames_update_estimate())
+
+        # ── Output Format Card ─────────────────────────────────────────────
+        fmt_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        fmt_card.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        fmt_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(fmt_card, text="OUTPUT FORMAT", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+
+        fmt_row = ctk.CTkFrame(fmt_card, fg_color="transparent")
+        fmt_row.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="ew")
+        self.frames_img_format = tk.StringVar(value="jpg")
+        ctk.CTkRadioButton(
+            fmt_row, text="JPEG (smaller files)", variable=self.frames_img_format, value="jpg",
+            command=self._frames_format_changed,
+        ).pack(side="left", padx=(0, 20))
+        ctk.CTkRadioButton(
+            fmt_row, text="PNG (lossless, larger)", variable=self.frames_img_format, value="png",
+            command=self._frames_format_changed,
+        ).pack(side="left")
+
+        # JPEG quality slider
+        self.frames_quality_frame = ctk.CTkFrame(fmt_card, fg_color="transparent")
+        self.frames_quality_frame.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="ew")
+        ctk.CTkLabel(self.frames_quality_frame, text="JPEG Quality:",
+                     text_color=MUTED).pack(side="left")
+        self.frames_quality_var = tk.IntVar(value=3)
+        self.frames_quality_slider = ctk.CTkSlider(
+            self.frames_quality_frame, from_=2, to=31, number_of_steps=29,
+            variable=self.frames_quality_var, width=200,
+        )
+        self.frames_quality_slider.pack(side="left", padx=(10, 6))
+        self.frames_quality_label_val = ctk.CTkLabel(
+            self.frames_quality_frame, text="3", text_color=TEXT, width=24)
+        self.frames_quality_label_val.pack(side="left")
+        ctk.CTkLabel(self.frames_quality_frame,
+                     text="(2=best quality  ·  31=smallest file)",
+                     text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="left", padx=8)
+        self.frames_quality_var.trace_add("write", lambda *_: self.frames_quality_label_val.configure(
+            text=str(self.frames_quality_var.get())))
+
+        # ── Post-processing Card ───────────────────────────────────────────
+        post_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        post_card.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        post_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(post_card, text="POST-PROCESSING", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+
+        self.frames_grayscale = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(post_card, text="Convert to Grayscale",
+                        variable=self.frames_grayscale).grid(
+            row=1, column=0, padx=16, pady=4, sticky="w")
+
+        resize_row = ctk.CTkFrame(post_card, fg_color="transparent")
+        resize_row.grid(row=2, column=0, padx=16, pady=(4, 14), sticky="w")
+        self.frames_resize_enabled = tk.BooleanVar(value=False)
+        ctk.CTkCheckBox(resize_row, text="Resize width to:",
+                        variable=self.frames_resize_enabled).pack(side="left")
+        self.frames_resize_entry = ctk.CTkEntry(resize_row, width=72, height=30,
+                                                placeholder_text="1280")
+        self.frames_resize_entry.pack(side="left", padx=(8, 4))
+        self.frames_resize_entry.insert(0, "1280")
+        ctk.CTkLabel(resize_row, text="px  (height auto-scaled)",
+                     text_color=MUTED).pack(side="left")
+
+        # ── Naming & Output Card ───────────────────────────────────────────
+        naming_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        naming_card.grid(row=5, column=0, sticky="ew", pady=(0, 10))
+        naming_card.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(naming_card, text="OUTPUT FILES", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=0, column=0, padx=16, pady=(14, 6), sticky="w")
+
+        naming_row = ctk.CTkFrame(naming_card, fg_color="transparent")
+        naming_row.grid(row=1, column=0, padx=16, pady=(0, 8), sticky="ew")
+        ctk.CTkLabel(naming_row, text="Prefix:", text_color=MUTED).pack(side="left")
+        self.frames_prefix_entry = ctk.CTkEntry(naming_row, width=110, height=30,
+                                                placeholder_text="frame")
+        self.frames_prefix_entry.pack(side="left", padx=(6, 16))
+        self.frames_prefix_entry.insert(0, "frame")
+        ctk.CTkLabel(naming_row, text="Start #:", text_color=MUTED).pack(side="left")
+        self.frames_startn_entry = ctk.CTkEntry(naming_row, width=64, height=30,
+                                                placeholder_text="1")
+        self.frames_startn_entry.pack(side="left", padx=(6, 16))
+        self.frames_startn_entry.insert(0, "1")
+        ctk.CTkLabel(naming_row, text="Digits:", text_color=MUTED).pack(side="left")
+        self.frames_digits_entry = ctk.CTkEntry(naming_row, width=52, height=30,
+                                                placeholder_text="5")
+        self.frames_digits_entry.pack(side="left", padx=(6, 0))
+        self.frames_digits_entry.insert(0, "5")
+
+        out_line = ctk.CTkFrame(naming_card, fg_color="transparent")
+        out_line.grid(row=2, column=0, padx=16, pady=(0, 14), sticky="ew")
+        out_line.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(naming_card, text="OUTPUT FOLDER", text_color="#64748b",
+                     font=ctk.CTkFont(size=10, weight="bold")).grid(
+            row=2, column=0, padx=16, pady=(6, 4), sticky="w")
+        out_folder_line = ctk.CTkFrame(naming_card, fg_color="transparent")
+        out_folder_line.grid(row=3, column=0, padx=16, pady=(0, 14), sticky="ew")
+        out_folder_line.grid_columnconfigure(0, weight=1)
+        self.frames_output_entry = ctk.CTkEntry(out_folder_line,
+                                                placeholder_text="Output folder…", height=36)
+        self.frames_output_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkButton(out_folder_line, text="Browse", width=90, height=36,
+                      command=self._choose_frames_output).grid(row=0, column=1, padx=(8, 0))
+
+        # ── Estimate & Actions ─────────────────────────────────────────────
+        est_card = ctk.CTkFrame(self.frames_tab, fg_color=PANEL, corner_radius=14)
+        est_card.grid(row=6, column=0, sticky="ew", pady=(0, 10))
+        est_card.grid_columnconfigure(0, weight=1)
+
+        self.frames_estimate_label = ctk.CTkLabel(
+            est_card,
+            text="Load a video to see an estimate.",
+            text_color=MUTED, anchor="w",
+        )
+        self.frames_estimate_label.grid(row=0, column=0, padx=16, pady=(12, 0), sticky="ew")
+
+        action_row = ctk.CTkFrame(est_card, fg_color="transparent")
+        action_row.grid(row=1, column=0, padx=16, pady=(8, 14), sticky="ew")
+        ctk.CTkButton(
+            action_row, text="Open Output Folder", width=145, height=36,
+            fg_color="#263247", hover_color="#35435a",
+            command=self._open_frames_output_folder,
+        ).pack(side="left")
+        ctk.CTkButton(
+            action_row, text="🎞  Extract Frames", width=165, height=40,
+            command=self.start_frames,
+        ).pack(side="right")
+
+        # ── Info tip ──────────────────────────────────────────────────────
+        tip = ctk.CTkFrame(self.frames_tab, fg_color="#101a2c", corner_radius=12)
+        tip.grid(row=7, column=0, sticky="ew", pady=(0, 16))
+        ctk.CTkLabel(tip, text="Tip", text_color="#c7d2fe",
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(
+            anchor="w", padx=14, pady=(12, 2))
+        ctk.CTkLabel(
+            tip,
+            text=("Keyframe-only mode is very fast because FFmpeg does not decode P/B frames. "
+                  "Fixed-FPS mode re-decodes every frame to hit the exact rate. "
+                  "Scene-cut mode scores each frame's visual delta — lower threshold = more frames."),
+            text_color=MUTED, wraplength=840, justify="left",
+        ).pack(anchor="w", padx=14, pady=(0, 12))
+
+    def _frames_mode_changed(self):
+        mode = self.frames_mode.get()
+        if mode == "fps":
+            self.frames_fps_row.grid()
+            self.frames_scene_row.grid_remove()
+        elif mode == "scene":
+            self.frames_fps_row.grid_remove()
+            self.frames_scene_row.grid()
+        else:
+            self.frames_fps_row.grid_remove()
+            self.frames_scene_row.grid_remove()
+        self._frames_update_estimate()
+
+    def _frames_format_changed(self):
+        if self.frames_img_format.get() == "jpg":
+            self.frames_quality_frame.grid()
+        else:
+            self.frames_quality_frame.grid_remove()
+
+    def _frames_update_estimate(self):
+        if self.frames_input_duration <= 0:
+            return
+        try:
+            if self.frames_range_mode.get() == "range":
+                start = parse_timecode(self.frames_start_entry.get())
+                end = parse_timecode(self.frames_end_entry.get())
+            else:
+                start, end = 0.0, self.frames_input_duration
+            span = max(0.0, end - start)
+            mode = self.frames_mode.get()
+            if mode in ("keyframes", "scene"):
+                text = f"Estimated output: variable (filtered) over {span:.1f}s"
+            elif mode == "all":
+                rate = self.frames_input_fps or 0
+                est = int(span * rate)
+                text = f"Estimated output: ~{est:,} frames over {span:.1f}s at {rate:.2f} fps"
+            else:  # fps
+                try:
+                    rate = float(self.frames_fps_entry.get())
+                except ValueError:
+                    rate = 0
+                est = int(span * rate)
+                text = f"Estimated output: ~{est:,} frames over {span:.1f}s at {rate:.2f} fps"
+            self.frames_estimate_label.configure(text=text)
+        except Exception:
+            pass
+
+    def _browse_frames_input(self):
+        path = filedialog.askopenfilename(
+            title="Select video",
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.wmv *.m4v *.ts *.mts"),
+                       ("All files", "*.*")],
+        )
+        if path:
+            self._set_entry(self.frames_input_entry, path)
+            # Auto-fill output folder
+            if not self.frames_output_entry.get().strip():
+                out = str(Path(path).with_suffix("")) + "_frames"
+                self._set_entry(self.frames_output_entry, out)
+            self._load_frames_input()
+
+    def _load_frames_input(self):
+        if not self._ensure_tools():
+            return
+        path = self.frames_input_entry.get().strip().strip('"')
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("Input video", "Please choose an existing video file.")
+            return
+
+        def worker():
+            try:
+                probe = MediaTools.probe(path)
+                duration = safe_float(probe.get("format", {}).get("duration"))
+                streams = probe.get("streams", [])
+                video = next((s for s in streams if s.get("codec_type") == "video"), {})
+                fps_raw = video.get("avg_frame_rate") or video.get("r_frame_rate") or "0/1"
+                num, _, den = fps_raw.partition("/")
+                fps = float(num) / float(den) if den and float(den) != 0 else float(num or 0)
+                info = (
+                    f"{format_seconds(duration)}  •  "
+                    f"{video.get('width', '?')}x{video.get('height', '?')}  •  "
+                    f"{video.get('codec_name', '?')}  •  {fps:.3f} fps"
+                )
+                self.ui_queue.put(("frames_load", path, duration, fps, info))
+            except Exception as exc:
+                self.ui_queue.put(("error", "Could not read video", str(exc)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _choose_frames_output(self):
+        folder = filedialog.askdirectory(title="Select output folder")
+        if folder:
+            self._set_entry(self.frames_output_entry, folder)
+
+    def _open_frames_output_folder(self):
+        folder = self.frames_output_entry.get().strip()
+        if folder and os.path.isdir(folder):
+            self._open_folder(folder)
+        else:
+            messagebox.showwarning("Folder not found",
+                                   "Output folder does not exist yet.\nRun an extraction first.")
+
+    def start_frames(self):
+        if self.busy:
+            return
+        if not self._ensure_tools():
+            return
+        path = self.frames_input_entry.get().strip().strip('"')
+        if not path or not os.path.isfile(path):
+            messagebox.showerror("Extract Frames", "Load a video first.")
+            return
+
+        out_folder = self.frames_output_entry.get().strip()
+        if not out_folder:
+            messagebox.showerror("Extract Frames", "Choose an output folder.")
+            return
+
+        mode = self.frames_mode.get()
+        if mode == "fps":
+            try:
+                fps_val = float(self.frames_fps_entry.get())
+                if fps_val <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Extract Frames", "FPS must be a positive number.")
+                return
+
+        if self.frames_range_mode.get() == "range":
+            try:
+                s = parse_timecode(self.frames_start_entry.get())
+                e = parse_timecode(self.frames_end_entry.get())
+                if e <= s:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Extract Frames",
+                                     "Invalid time range. End must be after Start.")
+                return
+
+        try:
+            int(self.frames_startn_entry.get())
+            int(self.frames_digits_entry.get())
+        except ValueError:
+            messagebox.showerror("Extract Frames",
+                                 "Start number and Digits must be integers.")
+            return
+
+        self.cancel_event = threading.Event()
+        threading.Thread(
+            target=self._frames_worker,
+            args=(path, out_folder),
+            daemon=True,
+        ).start()
+
+    def _frames_worker(self, source, out_folder):
+        self.ui_queue.put(("busy", True))
+        self.ui_queue.put(("progress", 0.0, "Preparing extraction…"))
+        try:
+            out_dir = Path(out_folder)
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            mode = self.frames_mode.get()
+            img_format = self.frames_img_format.get()
+            digits = int(self.frames_digits_entry.get())
+            prefix = self.frames_prefix_entry.get() or "frame"
+            start_num = int(self.frames_startn_entry.get())
+            pattern = str(out_dir / f"{prefix}_%0{digits}d.{img_format}")
+
+            # ---- Build FFmpeg command ----
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+
+            # Time range
+            if self.frames_range_mode.get() == "range":
+                ss = parse_timecode(self.frames_start_entry.get())
+                ee = parse_timecode(self.frames_end_entry.get())
+                cmd += ["-ss", f"{ss:.6f}"]
+                cmd += ["-i", source]
+                cmd += ["-t", f"{max(0.0, ee - ss):.6f}"]
+                total_seconds = max(0.001, ee - ss)
+            else:
+                cmd += ["-i", source]
+                total_seconds = max(0.001, self.frames_input_duration or 0.001)
+
+            # Video filters
+            vf_parts = []
+            if mode == "keyframes":
+                vf_parts.append("select=eq(pict_type\\,I)")
+            elif mode == "scene":
+                thresh = self.frames_scene_entry.get() or "0.3"
+                vf_parts.append(f"select=gt(scene\\,{thresh})")
+            elif mode == "fps":
+                fps_val = self.frames_fps_entry.get() or "12"
+                vf_parts.append(f"fps={fps_val}")
+            # else "all" — no fps filter
+
+            if self.frames_resize_enabled.get():
+                w = self.frames_resize_entry.get() or "1280"
+                vf_parts.append(f"scale={w}:-2")
+
+            if self.frames_grayscale.get():
+                vf_parts.append("hue=s=0")
+
+            if vf_parts:
+                cmd += ["-vf", ",".join(vf_parts)]
+
+            if mode in ("keyframes", "scene"):
+                cmd += ["-vsync", "vfr"]
+
+            if img_format == "jpg":
+                cmd += ["-qscale:v", str(self.frames_quality_var.get())]
+
+            cmd += ["-start_number", str(start_num)]
+            cmd += ["-progress", "pipe:2", "-nostats"]
+            cmd += [pattern]
+
+            self.log("Extract Frames command: " + " ".join(
+                f'"{c}"' if " " in c else c for c in cmd))
+
+            total_us = total_seconds * 1_000_000
+            frame_count = 0
+            current_us = 0
+
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                startupinfo=_WIN_STARTUPINFO,
+                creationflags=_WIN_CREATE_FLAGS,
+            )
+            self._set_current_process(proc)
+
+            stderr_lines = []
+            for raw in proc.stderr:
+                if self.cancel_event.is_set():
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                stderr_lines.append(line)
+                if len(stderr_lines) > 200:
+                    stderr_lines.pop(0)
+
+                if line.startswith("out_time_us="):
+                    current_us = safe_float(line.split("=", 1)[1])
+                    pct = min(current_us / total_us, 1.0)
+                    self.ui_queue.put(("frames_update", pct, frame_count))
+                elif line.startswith("frame="):
+                    try:
+                        frame_count = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif line.startswith("progress="):
+                    if line.endswith("end"):
+                        self.ui_queue.put(("frames_update", 1.0, frame_count))
+                elif "error" in line.lower() or "Error" in line:
+                    self.log(line)
+
+            return_code = proc.wait()
+            self._set_current_process(None)
+
+            if self.cancel_event.is_set():
+                self.ui_queue.put(("progress", 0.0, "Cancelled."))
+                return  # cancelled cleanly — no error dialog
+            if return_code != 0:
+                msg = "\n".join(stderr_lines[-15:]).strip()
+                raise RuntimeError(msg or f"FFmpeg exited with code {return_code}.")
+
+            # Count output files
+            try:
+                n_files = len(list(out_dir.glob(f"{prefix}_*.{img_format}")))
+            except Exception:
+                n_files = frame_count
+
+            self.log(f"Frame extraction complete: {n_files} frames saved to {out_folder}")
+            self.ui_queue.put(("finished", "Extraction complete",
+                               f"{n_files} frame(s) saved to:\n{out_folder}"))
+        except Exception as exc:
+            self.log(f"Extraction error: {exc}")
+            self.ui_queue.put(("error", "Extraction failed", str(exc)))
+        finally:
+            self._set_current_process(None)
+            self.ui_queue.put(("busy", False))
 
     # ------------------------ Common helpers ------------------------
 
@@ -1070,6 +1647,24 @@ class ClipForge(ctk.CTk):
                         self.timeline.set_range(new_start, new_end, emit=True)
                     self.progress_label.configure(
                         text=f"Snapped: A={format_seconds(new_start)}  B={format_seconds(new_end)}"
+                    )
+                elif kind == "frames_load":
+                    path, duration, fps, info = event[1], event[2], event[3], event[4]
+                    self.frames_input_path = path
+                    self.frames_input_duration = duration
+                    self.frames_input_fps = fps
+                    self.frames_info_label.configure(text=info, text_color=MUTED)
+                    self.frames_end_entry.delete(0, "end")
+                    self.frames_end_entry.insert(0, format_seconds(duration))
+                    self.log(f"Loaded: {Path(path).name}")
+                    self.progress.set(0)
+                    self.progress_label.configure(text="Ready")
+                    self._frames_update_estimate()
+                elif kind == "frames_update":
+                    pct, frame_count = event[1], event[2]
+                    self.progress.set(pct)
+                    self.progress_label.configure(
+                        text=f"Extracting frames… {pct * 100:.1f}%  ({frame_count} frames)"
                     )
         except queue.Empty:
             pass
