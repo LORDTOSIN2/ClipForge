@@ -1,15 +1,15 @@
-# ClipForge 1.1
+# ClipForge 1.2
 
-A lightweight CustomTkinter desktop frontend for FFmpeg focused on fast, low-waste video editing.
+A lightweight CustomTkinter desktop frontend for FFmpeg focused on **fast, low-waste** video editing.
 
 ## Install
 
 Make sure `ffmpeg` and `ffprobe` are available in your PATH.
 
-Then install the only Python dependency:
+Then install the Python dependencies:
 
 ```bash
-python -m pip install customtkinter
+python -m pip install -r requirements.txt
 ```
 
 Run:
@@ -23,50 +23,60 @@ python clipforge.py
 ### Cut & Remove
 - Add multiple sections such as `00:10 -> 00:15`.
 - Default: **Fast / Stream Copy (Keyframe)**.
-- Uses the requested **split -> discard -> concatenate** workflow with FFmpeg `-c copy`.
-- Kept compressed video/audio is copied rather than re-rendered.
-- Alternate **Frame-Accurate / Re-encode** mode renders the kept material when exact boundaries matter.
-- New draggable **A/B range selector**: drag the A and B dials to select a section, then add it to the removal list.
-- Each list row can pull the current A/B selection into its fields.
-- Automatic page scrolling keeps controls reachable on smaller screens.
-- Range validation catches empty, reversed, out-of-bounds and overlapping ranges.
+- Uses **split → discard → concatenate** with FFmpeg `-c copy` so kept video is **not** re-encoded.
+- **Single kept segment** → direct stream-copy to the final file (zero temp files).
+- **Multiple segments** → intermediates written as `.mkv` on the **output volume** (avoids filling system TEMP / C:).
+- Concat uses `-fflags +genpts -ignore_unknown -movflags +faststart` for reliable timestamps.
+- Alternate **Frame-Accurate / Re-encode** mode when exact boundaries matter.
+- Draggable **A/B range selector** with live frame previews at the boundaries.
+- Auto-merge of overlapping / contiguous ranges.
+- Instant cancel via process terminate.
 
 ### Join Videos
 - Add multiple clips and reorder them with up/down controls.
 - Fast stream-copy concat for compatible streams.
-- Re-encode/normalize option for mixed sources.
-- Scrollable clip list.
+- Re-encode / normalize option for mixed sources.
 
 ### Extract Audio
 - Extract the first audio stream.
-- **MP3** with V0/V2/V4 VBR or 320 kbps CBR.
+- **MP3** (V0 / V2 / V4 VBR or 320 kbps CBR).
 - **M4A (AAC)** at 256 kbps.
-- **WAV** as uncompressed PCM.
+- **WAV** uncompressed PCM.
+- Default output extension follows the selected format.
 
 ### General
 - `ffprobe` media information.
 - Progress bar and live FFmpeg log.
-- Copy/clear log controls.
+- Copy / clear log controls.
 - Open output folder button.
-- Overwrite confirmation before replacing an existing output.
-- Cancel button for running FFmpeg jobs.
-- FFmpeg runs on background threads so the interface stays responsive.
+- Overwrite confirmation.
+- Cancel button for running jobs.
+- FFmpeg runs on background threads (UI stays responsive).
 - Modern dark CustomTkinter UI.
+- Even-dimension padding fix for yuv420p (`trunc((ow-iw)/2/2)*2`).
 
 ## Important fast-cut behavior
 
-Stream-copy cutting is intentionally fast, but compressed video usually starts from a keyframe. Therefore fast mode is not frame-perfect; a requested boundary can move depending on the source video's keyframe/GOP layout.
+Stream-copy cutting is intentionally fast, but compressed video usually starts from a keyframe. Therefore fast mode is **not** frame-perfect; a requested boundary can snap to the nearest keyframe.
 
 Use **Frame-Accurate / Re-encode** when the exact frame matters.
 
 Fast joining also expects compatible streams. When inputs differ significantly, use **Re-encode / Normalize**.
 
-## 1.1 changes
+## What's new in 1.2
 
-- Fixed the cut page layout so the lower controls are no longer hidden behind the progress/log area.
-- Added vertical scrolling to the Cut, Join and Audio pages.
-- Added draggable A/B range dials.
-- Added one-click A/B-to-list range creation.
-- Added Clear All ranges.
-- Added MP3/M4A/WAV audio extraction.
-- Added overwrite confirmation, output-folder opening, and log controls.
+- Ultra-fast single-segment direct `-c copy` path (no temp files).
+- Multi-segment temp dir placed next to the output file (not system TEMP).
+- `.mkv` intermediate segments + improved concat flags (`+genpts`, `+faststart`).
+- Reliable instant cancel (`process.terminate()`).
+- Even pad offsets for yuv420p safety.
+- Audio export extension follows chosen format.
+- Auto-merge overlapping / contiguous cut ranges.
+- Keyframe snap + in-memory A/B thumbnails retained.
+
+## Requirements
+
+- Python 3.9+
+- FFmpeg + FFprobe in PATH
+- `customtkinter` ≥ 5.2
+- `pillow` ≥ 9.0
